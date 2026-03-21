@@ -85,7 +85,7 @@ def build_vmess_link(payload: dict[str, str]) -> str:
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
-        if self.path != "/api/v2ray":
+        if self.path != "/":
             self.respond_json(404, {"error": "Not Found"})
             return
 
