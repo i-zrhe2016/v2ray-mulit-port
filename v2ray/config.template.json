@@ -1,0 +1,37 @@
+{
+  "log": {
+    "loglevel": "__V2RAY_LOG_LEVEL__"
+  },
+  "inbounds": [
+    {
+      "port": __V2RAY_PORT__,
+      "listen": "0.0.0.0",
+      "protocol": "vmess",
+      "settings": {
+        "clients": [
+          {
+            "id": "__V2RAY_UUID__",
+            "alterId": __V2RAY_ALTER_ID__
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {
+          "path": "__V2RAY_WS_PATH__"
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "settings": {}
+    },
+    {
+      "protocol": "blackhole",
+      "settings": {},
+      "tag": "blocked"
+    }
+  ]
+}
