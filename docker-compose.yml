@@ -21,6 +21,11 @@ services:
     environment:
       API_PORT: 2016
 
+  subconverter:
+    image: tindy2013/subconverter:latest
+    container_name: v2ray-subconverter
+    restart: unless-stopped
+
   v2ray-gateway:
     image: nginx:1.27-alpine
     container_name: v2ray-gateway
@@ -28,6 +33,7 @@ services:
     depends_on:
       - v2ray
       - v2ray-api
+      - subconverter
     ports:
       - "10086:10086"
     volumes:

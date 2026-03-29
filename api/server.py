@@ -3,6 +3,7 @@ import json
 import os
 import socket
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlencode, urlsplit
 
 
 def parse_bool(value: str) -> bool:
@@ -48,6 +49,44 @@ def resolve_request_host(headers) -> str:
     return detect_server_ip()
 
 
+def resolve_request_scheme(headers) -> str:
+    forwarded_proto = headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip().lower()
+    if forwarded_proto in {"http", "https"}:
+        return forwarded_proto
+    return "http"
+
+
+def resolve_request_host_with_port(headers) -> str:
+    forwarded_host = headers.get("X-Forwarded-Host", "").split(",", 1)[0].strip()
+    direct_host = headers.get("Host", "").strip()
+
+    for candidate in (forwarded_host, direct_host):
+        if candidate:
+            return candidate
+
+    fallback_port = str(os.getenv("V2RAY_PORT", "10086")).strip() or "10086"
+    return f"{detect_server_ip()}:{fallback_port}"
+
+
+def build_request_base_url(headers) -> str:
+    configured_base = os.getenv("V2RAY_API_BASE_URL", "").strip().rstrip("/")
+    if configured_base:
+        return f"{configured_base}/"
+
+    request_scheme = resolve_request_scheme(headers)
+    request_host = resolve_request_host_with_port(headers)
+    return f"{request_scheme}://{request_host}/"
+
+
+def resolve_converter_base_url(headers) -> str:
+    configured_converter = os.getenv("V2RAY_SUBCONVERTER_URL", "").strip()
+    if configured_converter:
+        return configured_converter
+
+    request_base_url = build_request_base_url(headers).rstrip("/")
+    return f"{request_base_url}/sub"
+
+
 def build_vmess_payload(host_override: str = "") -> dict[str, str]:
     v2ray_uuid = os.getenv("V2RAY_UUID", "").strip()
     if not v2ray_uuid:
@@ -83,16 +122,66 @@ def build_vmess_link(payload: dict[str, str]) -> str:
     return f"vmess://{encoded}"
 
 
+def build_clash_subscription_link(
+    source_subscription_url: str,
+    converter_base_url: str = "",
+    template_url: str = "",
+) -> str:
+    source_url = source_subscription_url.strip()
+    if not source_url:
+        raise ValueError("source_subscription_url is required")
+
+    converter_base = converter_base_url.strip() or os.getenv(
+        "V2RAY_SUBCONVERTER_URL",
+        "",
+    ).strip()
+    if not converter_base:
+        raise ValueError("converter_base_url is required")
+
+    query = {
+        "target": "clash",
+        "url": source_url,
+    }
+
+    configured_template = template_url.strip() or os.getenv(
+        "V2RAY_SUBCONVERTER_TEMPLATE",
+        "",
+    ).strip()
+    if configured_template:
+        query["config"] = configured_template
+
+    delimiter = "&" if "?" in converter_base else "?"
+    return f"{converter_base}{delimiter}{urlencode(query)}"
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
-        if self.path != "/":
+        request_path = urlsplit(self.path).path
+        if request_path not in {"/", "/clash"}:
             self.respond_json(404, {"error": "Not Found"})
             return
 
         try:
             request_host = resolve_request_host(self.headers)
             payload = build_vmess_payload(request_host)
-            link = build_vmess_link(payload)
+            vmess_link = build_vmess_link(payload)
+        except ValueError as exc:
+            self.respond_json(500, {"error": str(exc)})
+            return
+
+        if request_path == "/":
+            self.respond_json(
+                200,
+                {
+                    "link": vmess_link,
+                    "config": payload,
+                },
+            )
+            return
+
+        try:
+            converter_base_url = resolve_converter_base_url(self.headers)
+            clash_link = build_clash_subscription_link(vmess_link, converter_base_url)
         except ValueError as exc:
             self.respond_json(500, {"error": str(exc)})
             return
@@ -100,8 +189,8 @@ class Handler(BaseHTTPRequestHandler):
         self.respond_json(
             200,
             {
-                "link": link,
-                "config": payload,
+                "link": clash_link,
+                "source": vmess_link,
             },
         )
 
