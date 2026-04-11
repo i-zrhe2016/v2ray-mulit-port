@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import socket
@@ -12,7 +13,7 @@ from urllib.parse import urlsplit
 from api.runtime import RuntimeSyncError, ShellV2RayRuntime
 from api.service import PanelService
 from api.store import StateStore
-from api.subscriptions import build_clash_converter_url, build_v2ray_subscription_body
+from api.subscriptions import build_clash_converter_url, build_v2ray_subscription_body, build_vmess_link, build_vmess_payload_variants
 
 
 def parse_bool(value: str) -> bool:
@@ -72,6 +73,26 @@ def resolve_request_scheme(headers) -> str:
     return "http"
 
 
+def is_local_request_host(candidate: str) -> bool:
+    host = strip_port(candidate)
+    if not host:
+        return False
+    normalized = host.strip().lower()
+    if normalized in {"localhost", "0.0.0.0", "::", "::1"}:
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def build_public_host_with_port() -> str:
+    configured_host = strip_port(os.getenv("V2RAY_PUBLIC_HOST", "").strip())
+    fallback_host = configured_host or detect_server_ip()
+    fallback_port = str(os.getenv("API_PORT", "2016")).strip() or "2016"
+    return f"{fallback_host}:{fallback_port}"
+
+
 def resolve_request_host_with_port(headers) -> str:
     configured_base = os.getenv("PANEL_PUBLIC_BASE_URL", "").strip()
     if configured_base:
@@ -82,10 +103,11 @@ def resolve_request_host_with_port(headers) -> str:
 
     for candidate in (forwarded_host, direct_host):
         if candidate:
+            if is_local_request_host(candidate):
+                return build_public_host_with_port()
             return candidate
 
-    fallback_port = str(os.getenv("API_PORT", "2016")).strip() or "2016"
-    return f"{detect_server_ip()}:{fallback_port}"
+    return build_public_host_with_port()
 
 
 def build_request_base_url(headers) -> str:
@@ -104,6 +126,14 @@ def resolve_internal_base_url() -> str:
         return configured_base
     api_port = str(os.getenv("API_PORT", "2016")).strip() or "2016"
     return f"http://127.0.0.1:{api_port}"
+
+
+def resolve_subscription_variant_count() -> int:
+    raw = os.getenv("V2RAY_SUBSCRIPTION_VARIANTS", "6").strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 6
 
 
 def parse_json_body(handler: BaseHTTPRequestHandler) -> dict:
@@ -300,7 +330,16 @@ class Handler(BaseHTTPRequestHandler):
             if record["status"] != "active":
                 self.respond_json(403, {"error": f"subscription is {record['status']}"})
                 return
-            body = build_v2ray_subscription_body(links["vmess_link"])
+            vmess_links = [
+                build_vmess_link(payload)
+                for payload in build_vmess_payload_variants(
+                    record,
+                    self.public_host,
+                    self.server.panel_service.tls_enabled,
+                    resolve_subscription_variant_count(),
+                )
+            ]
+            body = build_v2ray_subscription_body(vmess_links)
             self.respond_text(200, body, "text/plain; charset=utf-8")
             return
 

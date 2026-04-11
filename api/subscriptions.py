@@ -4,6 +4,8 @@ import base64
 import json
 from urllib.parse import urlencode
 
+SUBSCRIPTION_VARIANT_BASE_NAME = "Crown Backbone"
+
 
 def build_vmess_payload(record: dict, public_host: str, tls_enabled: bool) -> dict[str, str]:
     return {
@@ -22,14 +24,37 @@ def build_vmess_payload(record: dict, public_host: str, tls_enabled: bool) -> di
     }
 
 
+def build_vmess_payload_variants(
+    record: dict,
+    public_host: str,
+    tls_enabled: bool,
+    variant_count: int,
+) -> list[dict[str, str]]:
+    total = max(1, int(variant_count))
+    base_payload = build_vmess_payload(record, public_host, tls_enabled)
+    if total == 1:
+        return [base_payload]
+
+    variants: list[dict[str, str]] = []
+    for index in range(1, total + 1):
+        payload = dict(base_payload)
+        payload["ps"] = f"{SUBSCRIPTION_VARIANT_BASE_NAME} {index:02d}"
+        variants.append(payload)
+    return variants
+
+
 def build_vmess_link(payload: dict[str, str]) -> str:
     payload_json = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     encoded = base64.b64encode(payload_json.encode("utf-8")).decode("utf-8")
     return f"vmess://{encoded}"
 
 
-def build_v2ray_subscription_body(vmess_link: str) -> str:
-    content = f"{vmess_link}\n".encode("utf-8")
+def build_v2ray_subscription_body(vmess_links: str | list[str]) -> str:
+    if isinstance(vmess_links, str):
+        links = [vmess_links]
+    else:
+        links = list(vmess_links)
+    content = ("\n".join(links) + "\n").encode("utf-8")
     return base64.b64encode(content).decode("utf-8")
 
 

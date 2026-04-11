@@ -1,15 +1,19 @@
 import os
 import tempfile
 import unittest
+from base64 import b64decode
 
 from api import models
+from api.server import build_request_base_url, resolve_request_host_with_port
 from api.service import PanelService
 from api.store import StateStore, StateValidationError, validate_state
 from api.subscriptions import (
+    SUBSCRIPTION_VARIANT_BASE_NAME,
     build_clash_converter_url,
     build_v2ray_subscription_body,
     build_vmess_link,
     build_vmess_payload,
+    build_vmess_payload_variants,
 )
 
 
@@ -59,6 +63,63 @@ class SubscriptionTests(unittest.TestCase):
         body = build_v2ray_subscription_body(link)
         self.assertTrue(link.startswith("vmess://"))
         self.assertTrue(body)
+
+    def test_build_multi_variant_v2ray_subscription(self) -> None:
+        payloads = build_vmess_payload_variants(
+            {
+                "remark": "user-20001",
+                "port": 20001,
+                "uuid": "11111111-1111-1111-1111-111111111111",
+                "alter_id": 0,
+                "ws_path": "/ws/20001",
+            },
+            "example.com",
+            True,
+            6,
+        )
+        self.assertEqual(len(payloads), 6)
+        self.assertEqual(payloads[0]["ps"], f"{SUBSCRIPTION_VARIANT_BASE_NAME} 01")
+        self.assertEqual(payloads[-1]["ps"], f"{SUBSCRIPTION_VARIANT_BASE_NAME} 06")
+
+        links = [build_vmess_link(payload) for payload in payloads]
+        body = build_v2ray_subscription_body(links)
+        decoded = b64decode(body).decode("utf-8").strip().splitlines()
+        self.assertEqual(len(decoded), 6)
+        self.assertTrue(all(line.startswith("vmess://") for line in decoded))
+
+
+class RequestUrlResolutionTests(unittest.TestCase):
+    def test_localhost_request_uses_public_host_for_base_url(self) -> None:
+        original_public_host = os.environ.get("V2RAY_PUBLIC_HOST")
+        original_api_port = os.environ.get("API_PORT")
+        try:
+            os.environ["V2RAY_PUBLIC_HOST"] = "206.189.148.251"
+            os.environ["API_PORT"] = "2016"
+            headers = {"Host": "127.0.0.1:2016"}
+            self.assertEqual(resolve_request_host_with_port(headers), "206.189.148.251:2016")
+            self.assertEqual(build_request_base_url(headers), "http://206.189.148.251:2016")
+        finally:
+            if original_public_host is None:
+                os.environ.pop("V2RAY_PUBLIC_HOST", None)
+            else:
+                os.environ["V2RAY_PUBLIC_HOST"] = original_public_host
+            if original_api_port is None:
+                os.environ.pop("API_PORT", None)
+            else:
+                os.environ["API_PORT"] = original_api_port
+
+    def test_configured_public_base_url_wins(self) -> None:
+        original_public_base = os.environ.get("PANEL_PUBLIC_BASE_URL")
+        try:
+            os.environ["PANEL_PUBLIC_BASE_URL"] = "https://panel.example.com"
+            headers = {"Host": "127.0.0.1:2016"}
+            self.assertEqual(resolve_request_host_with_port(headers), "panel.example.com")
+            self.assertEqual(build_request_base_url(headers), "https://panel.example.com")
+        finally:
+            if original_public_base is None:
+                os.environ.pop("PANEL_PUBLIC_BASE_URL", None)
+            else:
+                os.environ["PANEL_PUBLIC_BASE_URL"] = original_public_base
 
 
 class StateStoreTests(unittest.TestCase):
