@@ -2,36 +2,60 @@
   "log": {
     "loglevel": "__V2RAY_LOG_LEVEL__"
   },
+  "stats": {},
+  "api": {
+    "tag": "api",
+    "services": [
+      "HandlerService",
+      "StatsService"
+    ]
+  },
+  "policy": {
+    "levels": {
+      "0": {
+        "statsUserUplink": true,
+        "statsUserDownlink": true
+      }
+    },
+    "system": {
+      "statsInboundUplink": true,
+      "statsInboundDownlink": true
+    }
+  },
   "inbounds": [
     {
-      "port": __V2RAY_PORT__,
+      "tag": "api",
       "listen": "0.0.0.0",
-      "protocol": "vmess",
+      "port": __V2RAY_API_PORT__,
+      "protocol": "dokodemo-door",
       "settings": {
-        "clients": [
-          {
-            "id": "__V2RAY_UUID__",
-            "alterId": __V2RAY_ALTER_ID__
-          }
-        ]
-      },
-      "streamSettings": {
-        "network": "ws",
-        "wsSettings": {
-          "path": "__V2RAY_WS_PATH__"
-        }
+        "address": "127.0.0.1",
+        "port": __V2RAY_API_PORT__,
+        "network": "tcp"
       }
     }
   ],
   "outbounds": [
     {
       "protocol": "freedom",
-      "settings": {}
+      "settings": {},
+      "tag": "direct"
     },
     {
       "protocol": "blackhole",
       "settings": {},
       "tag": "blocked"
     }
-  ]
+  ],
+  "routing": {
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": [
+          "api"
+        ],
+        "outboundTag": "api"
+      }
+    ]
+  }
 }
