@@ -51,7 +51,7 @@
 - `v2ray-panel` 监听固定管理端口，默认 `2016`
 - `v2ray` 对外发布一段固定端口范围，默认 `20000-20100`
 - 面板创建端口时，会通过 `v2ray api adi` 调用 V2Ray 官方 API 动态注册入站
-- 面板后台轮询 V2Ray 统计接口，更新每个端口的已用流量
+- 面板后台按配置读取流量累计值，默认使用 V2Ray StatsService，也可以改为读取 NGINX 导出的 JSON 统计文件
 - 端口流量耗尽或到期后，面板会自动把该端口从运行中的 V2Ray 实例移除
 
 ## 快速开始
@@ -67,6 +67,8 @@ V2RAY_PORT_RANGE_START=20000
 V2RAY_PORT_RANGE_END=20100
 V2RAY_PUBLIC_HOST=your-server-ip-or-domain
 V2RAY_PUBLIC_TLS=false
+TRAFFIC_STATS_SOURCE=v2ray
+NGINX_TRAFFIC_STATS_FILE=/data/nginx-traffic.json
 V2RAY_SUBCONVERTER_TEMPLATE=https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/config/ACL4SSR_Online.ini
 ```
 
@@ -75,6 +77,7 @@ V2RAY_SUBCONVERTER_TEMPLATE=https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/ma
 - `V2RAY_PUBLIC_HOST` 会写入每个端口生成出来的 VMess 配置
 - 如果你在外层自己做了 TLS 终止，可以设置 `V2RAY_PUBLIC_TLS=true`
 - 用户端口必须落在 `V2RAY_PORT_RANGE_START` 到 `V2RAY_PORT_RANGE_END` 之间
+- 如果由 NGINX 负责对外代理和流量计量，把 `TRAFFIC_STATS_SOURCE` 设为 `nginx_json`
 
 ### 2. 启动
 
@@ -166,10 +169,39 @@ http://your-host:2016/admin
   内部 `subconverter` 地址，默认 `http://subconverter:25500/sub`
 - `V2RAY_SUBCONVERTER_TEMPLATE`
   Clash 模板地址
+- `TRAFFIC_STATS_SOURCE`
+  流量统计来源。默认 `v2ray`，读取 V2Ray StatsService；设置为 `nginx_json` 或 `nginx` 时读取 NGINX JSON 文件
+- `NGINX_TRAFFIC_STATS_FILE`
+  NGINX JSON 统计文件路径，默认 `/data/nginx-traffic.json`。只有 `TRAFFIC_STATS_SOURCE=nginx_json` 或 `nginx` 时使用
+
+## NGINX 流量统计模式
+
+当实际入口是外层 NGINX，且 NGINX 代理到 V2Ray 时，可以让 NGINX 或旁路日志聚合作业写出每个端口的累计字节数，面板只读取这个文件作为流量来源。V2Ray 官方 API 仍用于动态添加、删除运行中的入站端口。
+
+配置示例：
+
+```env
+TRAFFIC_STATS_SOURCE=nginx_json
+NGINX_TRAFFIC_STATS_FILE=/data/nginx-traffic.json
+```
+
+`NGINX_TRAFFIC_STATS_FILE` 必须是面板容器可读路径。默认 `docker-compose.yml` 已把宿主机 `./data` 挂载到容器 `/data`，所以可以让 NGINX 侧任务把统计结果写到 `./data/nginx-traffic.json`。
+
+文件格式是一个 JSON 对象，key 是端口字符串，value 是该端口从 NGINX 视角看到的累计字节数。每个面板管理中的端口都必须有对应 key：
+
+```json
+{
+  "20001": 123456789,
+  "20002": 987654321
+}
+```
+
+这些值必须是非负整数，并且是单调递增的累计总量。面板的“流量清零”不会修改 NGINX 文件，而是把当前累计值记录为 `traffic_reset_base_bytes`，之后显示 `当前累计值 - 清零基线`。如果文件不存在、JSON 无效、某个端口缺少累计值或某个值非法，面板会保留上一次已知用量，并在端口的同步错误里显示失败原因，避免把流量猜成 0。
 
 ## 持久化
 
 - 所有端口状态保存在 `data/ports.json`
+- NGINX JSON 流量模式下，默认统计文件可放在 `data/nginx-traffic.json`
 - `docker compose down` 后，只要 `data/` 目录还在，端口配置就会保留
 - V2Ray 本身的动态入站不写回核心配置文件，所以容器重启后的恢复由面板完成
 
@@ -192,4 +224,4 @@ python3 -m unittest discover -s tests -v
 - 目前只做单机，不做多节点调度
 - 目前只支持 `vmess + ws`
 - 面板没有登录鉴权，默认用于自用或内网环境
-- 流量统计依赖 V2Ray 内部统计接口，精度受同步周期影响
+- 流量统计精度受同步周期和所选统计来源影响；NGINX 模式要求外部任务持续写入累计 JSON 文件

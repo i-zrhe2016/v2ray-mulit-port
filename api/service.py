@@ -17,10 +17,12 @@ class PanelService:
         port_range_start: int,
         port_range_end: int,
         reserved_ports: set[int] | None = None,
+        traffic_client=None,
         tls_enabled: bool = False,
     ) -> None:
         self.store = store
         self.runtime_client = runtime_client
+        self.traffic_client = traffic_client or runtime_client
         self.port_range_start = port_range_start
         self.port_range_end = port_range_end
         self.reserved_ports = reserved_ports or set()
@@ -109,8 +111,10 @@ class PanelService:
     def reset_traffic(self, port: int, base_url: str, public_host: str) -> dict[str, Any]:
         with self.lock:
             record = self._get_record(port)
-            totals = self.runtime_client.get_port_totals([record])
-            total_bytes = totals.get(port, 0)
+            totals = self.traffic_client.get_port_totals([record])
+            if port not in totals:
+                raise RuntimeSyncError(f"traffic total not found for port {port}")
+            total_bytes = totals[port]
             record["traffic_reset_base_bytes"] = total_bytes
             record["traffic_used_bytes"] = 0
             record["last_sync_error"] = ""
@@ -154,11 +158,10 @@ class PanelService:
 
         totals: dict[int, int] = {}
         stats_error = ""
-        if not uptime_error:
-            try:
-                totals = self.runtime_client.get_port_totals(records)
-            except RuntimeSyncError as exc:
-                stats_error = str(exc)
+        try:
+            totals = self.traffic_client.get_port_totals(records)
+        except RuntimeSyncError as exc:
+            stats_error = str(exc)
 
         for record in records:
             port = int(record["port"])

@@ -10,7 +10,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-from api.runtime import RuntimeSyncError, ShellV2RayRuntime
+from api.runtime import NginxJsonTrafficSource, RuntimeSyncError, ShellV2RayRuntime
 from api.service import PanelService
 from api.store import StateStore
 from api.subscriptions import build_clash_converter_url, build_v2ray_subscription_body, build_vmess_link, build_vmess_payload_variants
@@ -134,6 +134,18 @@ def resolve_subscription_variant_count() -> int:
         return max(1, int(raw))
     except ValueError:
         return 6
+
+
+def build_traffic_client(runtime_client):
+    source = os.getenv("TRAFFIC_STATS_SOURCE", "v2ray").strip().lower()
+    if source in {"", "v2ray", "v2ray_stats", "v2ray-stats"}:
+        return runtime_client
+    if source in {"nginx", "nginx_json", "nginx-json"}:
+        path = os.getenv("NGINX_TRAFFIC_STATS_FILE", "/data/nginx-traffic.json").strip()
+        if not path:
+            raise ValueError("NGINX_TRAFFIC_STATS_FILE is required when TRAFFIC_STATS_SOURCE uses nginx JSON")
+        return NginxJsonTrafficSource(path)
+    raise ValueError(f"unsupported TRAFFIC_STATS_SOURCE: {source}")
 
 
 def parse_json_body(handler: BaseHTTPRequestHandler) -> dict:
@@ -878,6 +890,7 @@ def main() -> None:
     panel_service = PanelService(
         store=StateStore(os.getenv("STATE_FILE", "/data/ports.json")),
         runtime_client=runtime,
+        traffic_client=build_traffic_client(runtime),
         port_range_start=port_range_start,
         port_range_end=port_range_end,
         reserved_ports={panel_port, v2ray_api_port},

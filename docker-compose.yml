@@ -30,6 +30,8 @@ services:
       PANEL_INTERNAL_BASE_URL: "http://v2ray-panel:2016"
       SUBCONVERTER_INTERNAL_URL: "http://subconverter:25500/sub"
       V2RAY_RUNTIME_ENABLED: "true"
+      TRAFFIC_STATS_SOURCE: "${TRAFFIC_STATS_SOURCE:-v2ray}"
+      NGINX_TRAFFIC_STATS_FILE: "${NGINX_TRAFFIC_STATS_FILE:-/data/nginx-traffic.json}"
     ports:
       - "${PANEL_PORT:-2016}:2016"
     extra_hosts:

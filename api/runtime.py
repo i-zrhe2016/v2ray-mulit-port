@@ -13,6 +13,10 @@ class RuntimeSyncError(RuntimeError):
     pass
 
 
+def _invalid_nginx_total(port: int, value: object) -> RuntimeSyncError:
+    return RuntimeSyncError(f"invalid nginx traffic total for port {port}: {value!r}")
+
+
 def _parse_int(value: object) -> int:
     if isinstance(value, bool):
         return int(value)
@@ -21,6 +25,27 @@ def _parse_int(value: object) -> int:
     if isinstance(value, str):
         return int(value.strip() or "0")
     raise ValueError(f"unsupported integer value: {value!r}")
+
+
+def _parse_nginx_total(port: int, value: object) -> int:
+    if isinstance(value, (bool, float)):
+        raise _invalid_nginx_total(port, value)
+    if isinstance(value, int):
+        total = value
+    elif isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            raise _invalid_nginx_total(port, value)
+        try:
+            total = int(raw)
+        except ValueError as exc:
+            raise _invalid_nginx_total(port, value) from exc
+    else:
+        raise _invalid_nginx_total(port, value)
+
+    if total < 0:
+        raise RuntimeSyncError(f"nginx traffic total must be non-negative for port {port}")
+    return total
 
 
 class ShellV2RayRuntime:
@@ -148,3 +173,41 @@ class ShellV2RayRuntime:
             raise RuntimeSyncError(message)
 
         return completed.stdout.strip()
+
+
+class NginxJsonTrafficSource:
+    def __init__(self, path: str) -> None:
+        self.path = path
+
+    def get_port_totals(self, records: Iterable[dict]) -> dict[int, int]:
+        ports = {int(record["port"]) for record in records}
+        if not ports:
+            return {}
+
+        try:
+            with open(self.path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except FileNotFoundError as exc:
+            raise RuntimeSyncError(f"nginx traffic stats file not found: {self.path}") from exc
+        except json.JSONDecodeError as exc:
+            raise RuntimeSyncError(f"invalid nginx traffic stats JSON: {exc.msg}") from exc
+        except OSError as exc:
+            raise RuntimeSyncError(f"failed to read nginx traffic stats file: {exc}") from exc
+
+        if not isinstance(data, dict):
+            raise RuntimeSyncError("nginx traffic stats must be a JSON object keyed by port")
+
+        totals: dict[int, int] = {}
+        missing_ports: list[int] = []
+        for port in ports:
+            key = str(port)
+            if key not in data:
+                missing_ports.append(port)
+                continue
+            totals[port] = _parse_nginx_total(port, data[key])
+
+        if missing_ports:
+            missing = ", ".join(str(port) for port in sorted(missing_ports))
+            raise RuntimeSyncError(f"nginx traffic total not found for port(s): {missing}")
+
+        return totals

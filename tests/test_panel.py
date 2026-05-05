@@ -1,10 +1,12 @@
+import json
 import os
 import tempfile
 import unittest
 from base64 import b64decode
 
 from api import models
-from api.server import build_request_base_url, resolve_request_host_with_port
+from api.runtime import NginxJsonTrafficSource, RuntimeSyncError
+from api.server import build_request_base_url, build_traffic_client, resolve_request_host_with_port
 from api.service import PanelService
 from api.store import StateStore, StateValidationError, validate_state
 from api.subscriptions import (
@@ -34,6 +36,26 @@ class FakeRuntimeClient:
 
     def remove_inbound(self, record) -> None:
         self.active_ports.discard(int(record["port"]))
+
+
+class FakeTrafficSource:
+    def __init__(self) -> None:
+        self.totals: dict[int, int] = {}
+
+    def get_port_totals(self, records):
+        return {
+            int(record["port"]): self.totals[int(record["port"])]
+            for record in records
+            if int(record["port"]) in self.totals
+        }
+
+
+class FailingTrafficSource:
+    def __init__(self, message: str) -> None:
+        self.message = message
+
+    def get_port_totals(self, records):
+        raise RuntimeSyncError(self.message)
 
 
 class SubscriptionTests(unittest.TestCase):
@@ -122,6 +144,32 @@ class RequestUrlResolutionTests(unittest.TestCase):
                 os.environ["PANEL_PUBLIC_BASE_URL"] = original_public_base
 
 
+class TrafficSourceConfigTests(unittest.TestCase):
+    def test_build_traffic_client_uses_runtime_by_default_and_nginx_when_configured(self) -> None:
+        original_source = os.environ.get("TRAFFIC_STATS_SOURCE")
+        original_path = os.environ.get("NGINX_TRAFFIC_STATS_FILE")
+        try:
+            os.environ.pop("TRAFFIC_STATS_SOURCE", None)
+            os.environ.pop("NGINX_TRAFFIC_STATS_FILE", None)
+            runtime = FakeRuntimeClient()
+            self.assertIs(build_traffic_client(runtime), runtime)
+
+            os.environ["TRAFFIC_STATS_SOURCE"] = "nginx_json"
+            os.environ["NGINX_TRAFFIC_STATS_FILE"] = "/tmp/nginx-traffic.json"
+            source = build_traffic_client(runtime)
+            self.assertIsInstance(source, NginxJsonTrafficSource)
+            self.assertEqual(source.path, "/tmp/nginx-traffic.json")
+        finally:
+            if original_source is None:
+                os.environ.pop("TRAFFIC_STATS_SOURCE", None)
+            else:
+                os.environ["TRAFFIC_STATS_SOURCE"] = original_source
+            if original_path is None:
+                os.environ.pop("NGINX_TRAFFIC_STATS_FILE", None)
+            else:
+                os.environ["NGINX_TRAFFIC_STATS_FILE"] = original_path
+
+
 class StateStoreTests(unittest.TestCase):
     def test_validate_state_rejects_duplicate_ports(self) -> None:
         with self.assertRaises(StateValidationError):
@@ -145,6 +193,60 @@ class StateStoreTests(unittest.TestCase):
             loaded = store.load()
             self.assertEqual(len(loaded["ports"]), 1)
             self.assertEqual(loaded["ports"][0]["port"], 20001)
+
+
+class NginxJsonTrafficSourceTests(unittest.TestCase):
+    def test_reads_cumulative_totals_by_port(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stats_path = os.path.join(temp_dir, "nginx-traffic.json")
+            with open(stats_path, "w", encoding="utf-8") as handle:
+                json.dump({"20001": 123456789, "20002": "987654321"}, handle)
+
+            source = NginxJsonTrafficSource(stats_path)
+            totals = source.get_port_totals(
+                [
+                    {"port": 20001},
+                    {"port": 20002},
+                ],
+            )
+
+            self.assertEqual(totals, {20001: 123456789, 20002: 987654321})
+
+    def test_missing_or_invalid_file_raises_runtime_sync_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = NginxJsonTrafficSource(os.path.join(temp_dir, "missing.json"))
+            with self.assertRaises(RuntimeSyncError):
+                source.get_port_totals([{"port": 20001}])
+
+            stats_path = os.path.join(temp_dir, "nginx-traffic.json")
+            with open(stats_path, "w", encoding="utf-8") as handle:
+                handle.write("{invalid")
+            source = NginxJsonTrafficSource(stats_path)
+            with self.assertRaises(RuntimeSyncError):
+                source.get_port_totals([{"port": 20001}])
+
+    def test_missing_port_total_raises_runtime_sync_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stats_path = os.path.join(temp_dir, "nginx-traffic.json")
+            with open(stats_path, "w", encoding="utf-8") as handle:
+                json.dump({"20001": 123456789}, handle)
+
+            source = NginxJsonTrafficSource(stats_path)
+            with self.assertRaises(RuntimeSyncError):
+                source.get_port_totals([{"port": 20001}, {"port": 20002}])
+
+    def test_invalid_port_total_raises_runtime_sync_error(self) -> None:
+        invalid_values = [-1, True, 1.5, ""]
+        for value in invalid_values:
+            with self.subTest(value=value):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    stats_path = os.path.join(temp_dir, "nginx-traffic.json")
+                    with open(stats_path, "w", encoding="utf-8") as handle:
+                        json.dump({"20001": value}, handle)
+
+                    source = NginxJsonTrafficSource(stats_path)
+                    with self.assertRaises(RuntimeSyncError):
+                        source.get_port_totals([{"port": 20001}])
 
 
 class PanelServiceTests(unittest.TestCase):
@@ -234,3 +336,97 @@ class PanelServiceTests(unittest.TestCase):
                 "https://panel.example.com",
                 "example.com",
             )
+
+    def test_separate_traffic_source_drives_usage_reset_and_exhaustion(self) -> None:
+        traffic = FakeTrafficSource()
+        service = PanelService(
+            store=self.store,
+            runtime_client=self.runtime,
+            traffic_client=traffic,
+            port_range_start=20000,
+            port_range_end=20010,
+            reserved_ports={2016, 10085},
+            tls_enabled=False,
+        )
+
+        created = service.create_port(
+            {"port": 20001, "traffic_limit_bytes": 4096, "expires_at": models.default_expires_at()},
+            "https://panel.example.com",
+            "example.com",
+        )
+        self.assertEqual(created["traffic_used_bytes"], 0)
+        self.assertIn(20001, self.runtime.active_ports)
+
+        traffic.totals[20001] = 2048
+        synced = service.sync_port(20001, "https://panel.example.com", "example.com")
+        self.assertEqual(synced["traffic_used_bytes"], 2048)
+        self.assertEqual(synced["status"], "active")
+        self.assertIn(20001, self.runtime.active_ports)
+
+        traffic.totals[20001] = 3072
+        reset = service.reset_traffic(20001, "https://panel.example.com", "example.com")
+        self.assertEqual(reset["traffic_used_bytes"], 0)
+        self.assertEqual(reset["traffic_reset_base_bytes"], 3072)
+
+        traffic.totals[20001] = 8000
+        exhausted = service.sync_port(20001, "https://panel.example.com", "example.com")
+        self.assertEqual(exhausted["traffic_used_bytes"], 4928)
+        self.assertEqual(exhausted["status"], "exhausted")
+        self.assertNotIn(20001, self.runtime.active_ports)
+
+    def test_traffic_source_error_preserves_usage_and_surfaces_sync_error(self) -> None:
+        traffic = FakeTrafficSource()
+        service = PanelService(
+            store=self.store,
+            runtime_client=self.runtime,
+            traffic_client=traffic,
+            port_range_start=20000,
+            port_range_end=20010,
+            reserved_ports={2016, 10085},
+            tls_enabled=False,
+        )
+        service.create_port(
+            {"port": 20001, "traffic_limit_bytes": 4096, "expires_at": models.default_expires_at()},
+            "https://panel.example.com",
+            "example.com",
+        )
+        traffic.totals[20001] = 2048
+        service.sync_port(20001, "https://panel.example.com", "example.com")
+
+        service.traffic_client = FailingTrafficSource("nginx stats unavailable")
+        synced = service.sync_port(20001, "https://panel.example.com", "example.com")
+
+        self.assertEqual(synced["traffic_used_bytes"], 2048)
+        self.assertEqual(synced["status"], "sync_error")
+        self.assertEqual(synced["last_sync_error"], "nginx stats unavailable")
+
+    def test_missing_nginx_port_total_preserves_usage_and_surfaces_sync_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stats_path = os.path.join(temp_dir, "nginx-traffic.json")
+            with open(stats_path, "w", encoding="utf-8") as handle:
+                json.dump({"20001": 2048}, handle)
+
+            service = PanelService(
+                store=self.store,
+                runtime_client=self.runtime,
+                traffic_client=NginxJsonTrafficSource(stats_path),
+                port_range_start=20000,
+                port_range_end=20010,
+                reserved_ports={2016, 10085},
+                tls_enabled=False,
+            )
+            service.create_port(
+                {"port": 20001, "traffic_limit_bytes": 4096, "expires_at": models.default_expires_at()},
+                "https://panel.example.com",
+                "example.com",
+            )
+            synced = service.sync_port(20001, "https://panel.example.com", "example.com")
+            self.assertEqual(synced["traffic_used_bytes"], 2048)
+
+            with open(stats_path, "w", encoding="utf-8") as handle:
+                json.dump({}, handle)
+
+            stale = service.sync_port(20001, "https://panel.example.com", "example.com")
+            self.assertEqual(stale["traffic_used_bytes"], 2048)
+            self.assertEqual(stale["status"], "sync_error")
+            self.assertIn("not found", stale["last_sync_error"])
