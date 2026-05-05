@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import tempfile
 from typing import Iterable
@@ -211,3 +212,105 @@ class NginxJsonTrafficSource:
             raise RuntimeSyncError(f"nginx traffic total not found for port(s): {missing}")
 
         return totals
+
+
+class NginxPortManager:
+    def __init__(
+        self,
+        output_path: str,
+        reload_command: str,
+        upstream_host: str,
+        upstream_port: int,
+        timeout_seconds: int = 10,
+    ) -> None:
+        self.output_path = output_path
+        self.reload_command = reload_command
+        self.upstream_host = upstream_host
+        self.upstream_port = upstream_port
+        self.timeout_seconds = timeout_seconds
+
+    def configure(
+        self,
+        output_path: str,
+        reload_command: str,
+        upstream_host: str,
+        upstream_port: int,
+    ) -> None:
+        self.output_path = output_path
+        self.reload_command = reload_command
+        self.upstream_host = upstream_host
+        self.upstream_port = upstream_port
+
+    def render(self, records: Iterable[dict]) -> str:
+        active_records = sorted(records, key=lambda item: int(item["port"]))
+        lines = [
+            "# Managed by v2ray-panel. Include this file from an nginx http context.",
+        ]
+        for record in active_records:
+            port = int(record["port"])
+            path = str(record.get("ws_path", "/")).strip() or "/"
+            lines.extend(
+                [
+                    "server {",
+                    f"    listen {port};",
+                    "    location / {",
+                    "        return 404;",
+                    "    }",
+                    f"    location = {path} {{",
+                    f"        proxy_pass http://{self.upstream_host}:{self.upstream_port};",
+                    "        proxy_http_version 1.1;",
+                    "        proxy_set_header Upgrade $http_upgrade;",
+                    '        proxy_set_header Connection "upgrade";',
+                    "        proxy_set_header Host $host;",
+                    "    }",
+                    "}",
+                ],
+            )
+        lines.append("")
+        return "\n".join(lines)
+
+    def write_config(self, content: str) -> None:
+        directory = os.path.dirname(self.output_path) or "."
+        os.makedirs(directory, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(
+            prefix=".nginx-managed.",
+            suffix=".conf",
+            dir=directory,
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(content)
+            os.replace(temp_path, self.output_path)
+        except OSError as exc:
+            raise RuntimeSyncError(f"failed to write nginx config: {exc}") from exc
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+    def reload(self) -> None:
+        command = shlex.split(self.reload_command)
+        if not command:
+            raise RuntimeSyncError("nginx reload command is required")
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=self.timeout_seconds,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeSyncError(f"nginx reload command not found: {command[0]}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeSyncError(f"nginx reload timed out: {' '.join(command)}") from exc
+
+        if completed.returncode != 0:
+            message = (completed.stderr or completed.stdout or "").strip()
+            if not message:
+                message = f"nginx reload failed with exit code {completed.returncode}"
+            raise RuntimeSyncError(message)
+
+    def sync(self, records: Iterable[dict]) -> None:
+        content = self.render(records)
+        self.write_config(content)
+        self.reload()

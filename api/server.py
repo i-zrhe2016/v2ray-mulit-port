@@ -10,30 +10,11 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-from api.runtime import NginxJsonTrafficSource, RuntimeSyncError, ShellV2RayRuntime
+from api.runtime import NginxJsonTrafficSource, NginxPortManager, RuntimeSyncError, ShellV2RayRuntime
 from api.service import PanelService
+from api.settings import default_server_settings, parse_bool, strip_port
 from api.store import StateStore
 from api.subscriptions import build_clash_converter_url, build_v2ray_subscription_body, build_vmess_link, build_vmess_payload_variants
-
-
-def parse_bool(value: str) -> bool:
-    return value.lower() in {"1", "true", "yes", "on"}
-
-
-def strip_port(host: str) -> str:
-    raw = host.strip()
-    if not raw:
-        return ""
-
-    if raw.startswith("["):
-        end = raw.find("]")
-        if end > 1:
-            return raw[1:end]
-
-    if raw.count(":") == 1:
-        return raw.split(":", 1)[0]
-
-    return raw
 
 
 def detect_server_ip() -> str:
@@ -47,8 +28,9 @@ def detect_server_ip() -> str:
         sock.close()
 
 
-def resolve_request_host(headers) -> str:
-    configured_host = os.getenv("V2RAY_PUBLIC_HOST", "").strip()
+def resolve_request_host(headers, configured_host: str | None = None) -> str:
+    if configured_host is None:
+        configured_host = os.getenv("V2RAY_PUBLIC_HOST", "").strip()
     if configured_host:
         return strip_port(configured_host)
 
@@ -136,12 +118,13 @@ def resolve_subscription_variant_count() -> int:
         return 6
 
 
-def build_traffic_client(runtime_client):
-    source = os.getenv("TRAFFIC_STATS_SOURCE", "v2ray").strip().lower()
-    if source in {"", "v2ray", "v2ray_stats", "v2ray-stats"}:
+def build_traffic_client(runtime_client, server_settings: dict | None = None):
+    settings = server_settings or default_server_settings()
+    source = str(settings["traffic_stats_source"]).strip().lower()
+    if source == "v2ray":
         return runtime_client
-    if source in {"nginx", "nginx_json", "nginx-json"}:
-        path = os.getenv("NGINX_TRAFFIC_STATS_FILE", "/data/nginx-traffic.json").strip()
+    if source == "nginx_json":
+        path = str(settings["nginx_stats_json_path"]).strip()
         if not path:
             raise ValueError("NGINX_TRAFFIC_STATS_FILE is required when TRAFFIC_STATS_SOURCE uses nginx JSON")
         return NginxJsonTrafficSource(path)
@@ -176,6 +159,9 @@ class Handler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if request_path == "/api/settings":
+            self.respond_json(200, self.server.panel_service.get_settings())
+            return
         if request_path.startswith("/links/"):
             self.handle_links_lookup(request_path.rsplit("/", 1)[-1])
             return
@@ -204,13 +190,19 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_sync_port(port)
             return
         if request_path == "/api/sync":
-            self.server.panel_service.sync_all()
-            self.respond_json(200, {"ok": True})
+            try:
+                self.server.panel_service.sync_all()
+                self.respond_json(200, {"ok": True})
+            except RuntimeSyncError as exc:
+                self.respond_json(500, {"error": str(exc)})
             return
         self.respond_json(404, {"error": "Not Found"})
 
     def do_PATCH(self) -> None:  # noqa: N802
         request_path = urlsplit(self.path).path
+        if request_path == "/api/settings":
+            self.handle_update_settings()
+            return
         if request_path.startswith("/api/ports/"):
             port = self.extract_port(request_path, "/api/ports/", "")
             self.handle_update_port(port)
@@ -231,7 +223,8 @@ class Handler(BaseHTTPRequestHandler):
 
     @property
     def public_host(self) -> str:
-        return resolve_request_host(self.headers)
+        fallback_host = resolve_request_host(self.headers, configured_host="")
+        return self.server.panel_service.resolve_public_host(fallback_host)
 
     def handle_create_port(self) -> None:
         try:
@@ -259,6 +252,16 @@ class Handler(BaseHTTPRequestHandler):
             self.respond_json(200, record)
         except KeyError as exc:
             self.respond_json(404, {"error": str(exc)})
+        except ValueError as exc:
+            self.respond_json(400, {"error": str(exc)})
+        except RuntimeSyncError as exc:
+            self.respond_json(500, {"error": str(exc)})
+
+    def handle_update_settings(self) -> None:
+        try:
+            payload = parse_json_body(self)
+            settings = self.server.panel_service.update_settings(payload)
+            self.respond_json(200, settings)
         except ValueError as exc:
             self.respond_json(400, {"error": str(exc)})
         except RuntimeSyncError as exc:
@@ -551,7 +554,7 @@ def render_admin_page() -> str:
       font-size: 13px;
       color: var(--muted);
     }}
-    input {{
+    input, select {{
       width: 100%;
       border: 1px solid var(--line);
       border-radius: 12px;
@@ -559,6 +562,16 @@ def render_admin_page() -> str:
       font: inherit;
       color: var(--ink);
       background: rgba(255,255,255,0.9);
+    }}
+    input[type="checkbox"] {{
+      width: auto;
+      accent-color: var(--accent);
+    }}
+    .checkbox-row {{
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-height: 42px;
     }}
     .port-card {{
       background: var(--panel);
@@ -636,7 +649,7 @@ def render_admin_page() -> str:
     <section class="hero">
       <div class="hero-card">
         <h1>V2Ray 多端口面板</h1>
-        <p>一个端口对应一个订阅。面板负责端口创建、删除、流量统计、到期禁用、Clash/V2Ray 订阅和运行时同步。</p>
+        <p>一个端口对应一个订阅。面板负责端口创建、删除、流量统计、到期禁用、Clash/V2Ray 订阅，以及生成 NGINX 监听配置转发到单一 V2Ray upstream。</p>
         <div class="metrics">
           <div class="metric"><b id="metric-total">0</b><span>总端口</span></div>
           <div class="metric"><b id="metric-active">0</b><span>活跃</span></div>
@@ -663,6 +676,30 @@ def render_admin_page() -> str:
         </div>
         <p class="muted" id="message"></p>
       </div>
+    </section>
+    <section class="panel">
+      <h2>服务器设置</h2>
+      <div class="field-grid">
+        <label>V2Ray API 地址<input id="settings-v2ray-api-server" type="text" placeholder="127.0.0.1:10085"></label>
+        <label>固定 V2Ray 上游主机<input id="settings-upstream-host" type="text" placeholder="127.0.0.1"></label>
+        <label>固定 V2Ray 上游端口<input id="settings-upstream-port" type="number" min="1" max="65535" placeholder="10085"></label>
+        <label>公开 V2Ray 主机<input id="settings-public-host" type="text" placeholder="example.com"></label>
+        <label>流量统计来源
+          <select id="settings-traffic-source">
+            <option value="v2ray">v2ray</option>
+            <option value="nginx_json">nginx_json</option>
+          </select>
+        </label>
+        <label>NGINX JSON 路径<input id="settings-nginx-path" type="text" placeholder="/data/nginx-traffic.json"></label>
+        <label>NGINX 配置输出<input id="settings-nginx-config-path" type="text" placeholder="/data/nginx-managed-http.conf"></label>
+        <label>NGINX 重载命令<input id="settings-nginx-reload-command" type="text" placeholder="nginx -s reload"></label>
+        <label class="checkbox-row"><input id="settings-public-tls" type="checkbox">公开 TLS</label>
+      </div>
+      <div class="toolbar">
+        <button onclick="saveSettings()">保存服务器设置</button>
+        <button class="secondary" onclick="loadSettings()">刷新设置</button>
+      </div>
+      <p class="muted" id="settings-message"></p>
     </section>
     <section class="cards" id="port-list"></section>
   </div>
@@ -697,6 +734,12 @@ def render_admin_page() -> str:
 
     function setMessage(text, isError = false) {{
       const element = document.getElementById("message");
+      element.textContent = text;
+      element.style.color = isError ? "var(--bad)" : "var(--muted)";
+    }}
+
+    function setSettingsMessage(text, isError = false) {{
+      const element = document.getElementById("settings-message");
       element.textContent = text;
       element.style.color = isError ? "var(--bad)" : "var(--muted)";
     }}
@@ -764,6 +807,41 @@ def render_admin_page() -> str:
           <p class="muted" style="margin-top:10px;">最后同步: ${{port.last_synced_at || "尚未同步"}}${{lastError ? ` | 错误: ${{lastError}}` : ""}}</p>
         </article>
       `;
+    }}
+
+    async function loadSettings() {{
+      const settings = await api("/api/settings");
+      document.getElementById("settings-v2ray-api-server").value = settings.v2ray_api_server || "";
+      document.getElementById("settings-upstream-host").value = settings.fixed_v2ray_upstream_host || "";
+      document.getElementById("settings-upstream-port").value = settings.fixed_v2ray_upstream_port || "";
+      document.getElementById("settings-public-host").value = settings.public_v2ray_host || "";
+      document.getElementById("settings-public-tls").checked = Boolean(settings.public_tls);
+      document.getElementById("settings-traffic-source").value = settings.traffic_stats_source || "v2ray";
+      document.getElementById("settings-nginx-path").value = settings.nginx_stats_json_path || "";
+      document.getElementById("settings-nginx-config-path").value = settings.nginx_config_output_path || "";
+      document.getElementById("settings-nginx-reload-command").value = settings.nginx_reload_command || "";
+    }}
+
+    async function saveSettings() {{
+      const payload = {{
+        v2ray_api_server: document.getElementById("settings-v2ray-api-server").value.trim(),
+        fixed_v2ray_upstream_host: document.getElementById("settings-upstream-host").value.trim(),
+        fixed_v2ray_upstream_port: Number(document.getElementById("settings-upstream-port").value || "0"),
+        public_v2ray_host: document.getElementById("settings-public-host").value.trim(),
+        public_tls: document.getElementById("settings-public-tls").checked,
+        traffic_stats_source: document.getElementById("settings-traffic-source").value,
+        nginx_stats_json_path: document.getElementById("settings-nginx-path").value.trim(),
+        nginx_config_output_path: document.getElementById("settings-nginx-config-path").value.trim(),
+        nginx_reload_command: document.getElementById("settings-nginx-reload-command").value.trim(),
+      }};
+      try {{
+        await api("/api/settings", {{ method: "PATCH", body: JSON.stringify(payload) }});
+        setSettingsMessage("服务器设置已保存");
+        await loadSettings();
+        await loadPorts();
+      }} catch (error) {{
+        setSettingsMessage(error.message, true);
+      }}
     }}
 
     async function loadPorts() {{
@@ -862,7 +940,7 @@ def render_admin_page() -> str:
     }}
 
     document.getElementById("add-expire").value = isoToLocalValue(new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString());
-    loadPorts().catch((error) => setMessage(error.message, true));
+    Promise.all([loadSettings(), loadPorts()]).catch((error) => setMessage(error.message, true));
   </script>
 </body>
 </html>"""
@@ -881,20 +959,30 @@ def main() -> None:
     panel_port = listen_port
     v2ray_api_port = int(os.getenv("V2RAY_API_PORT", "10085"))
     runtime_enabled = parse_bool(os.getenv("V2RAY_RUNTIME_ENABLED", "true"))
+    server_settings_defaults = default_server_settings()
     runtime = ShellV2RayRuntime(
         command=os.getenv("V2RAY_API_COMMAND", "v2ray"),
-        server=os.getenv("V2RAY_API_SERVER", f"127.0.0.1:{v2ray_api_port}"),
+        server=server_settings_defaults["v2ray_api_server"],
         timeout_seconds=int(os.getenv("V2RAY_API_TIMEOUT_SECONDS", "10")),
         enabled=runtime_enabled,
+    )
+    nginx_port_manager = NginxPortManager(
+        output_path=server_settings_defaults["nginx_config_output_path"],
+        reload_command=server_settings_defaults["nginx_reload_command"],
+        upstream_host=server_settings_defaults["fixed_v2ray_upstream_host"],
+        upstream_port=int(server_settings_defaults["fixed_v2ray_upstream_port"]),
+        timeout_seconds=int(os.getenv("NGINX_RELOAD_TIMEOUT_SECONDS", "10")),
     )
     panel_service = PanelService(
         store=StateStore(os.getenv("STATE_FILE", "/data/ports.json")),
         runtime_client=runtime,
-        traffic_client=build_traffic_client(runtime),
+        nginx_port_manager=nginx_port_manager,
+        traffic_client_factory=build_traffic_client,
         port_range_start=port_range_start,
         port_range_end=port_range_end,
         reserved_ports={panel_port, v2ray_api_port},
-        tls_enabled=parse_bool(os.getenv("V2RAY_PUBLIC_TLS", "false")),
+        tls_enabled=server_settings_defaults["public_tls"],
+        server_settings_defaults=server_settings_defaults,
     )
     panel_service.initialize()
     server = PanelHTTPServer(("0.0.0.0", listen_port), Handler, panel_service, sync_interval)
